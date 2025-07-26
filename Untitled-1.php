@@ -1,0 +1,591 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import signal
+from scipy.signal import filtfilt, lfilter
+from scipy.io import loadmat
+import wfdb
+import pandas as pd
+from sklearn.metrics import confusion_matrix, classification_report
+
+class PanTompkins:
+    def __init__(self, fs=200):
+        self.fs = fs
+        self.initialize_filters()
+        self.reset_parameters()
+        
+    def initialize_filters(self):
+        """Initialize all filters used in the algorithm"""
+        # Bandpass filter (cascaded lowpass and highpass)
+        self.lowpass_b = np.array([1, 0, 0, 0, 0, 0, -2, 0, 0, 0, 0, 0, 1])
+        self.lowpass_a = np.array([1, -2, 1])
+        
+        self.highpass_b = np.array([-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 32, 
+                                    -32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1])
+        self.highpass_a = np.array([1, -1])
+        
+        # Derivative filter
+        self.derivative_b = np.array([1, 2, 0, -2, -1]) * (1/8) * self.fs
+        self.derivative_a = np.array([1])
+        
+        # Moving window integration (done in process method)
+        self.integration_window = int(0.15 * self.fs)  # 150ms window
+        
+    def reset_parameters(self):
+        """Reset adaptive thresholds and parameters"""
+        # For filtered signal
+        self.SPKF = 0  # Running estimate of signal peak (filtered)
+        self.NPKF = 0  # Running estimate of noise peak (filtered)
+        self.THRESHOLDF1 = 0  # First threshold (filtered)
+        self.THRESHOLDF2 = 0  # Second threshold (filtered)
+        
+        # For integrated signal
+        self.SPKI = 0  # Running estimate of signal peak (integrated)
+        self.NPKI = 0  # Running estimate of noise peak (integrated)
+        self.THRESHOLDI1 = 0  # First threshold (integrated)
+        self.THRESHOLDI2 = 0  # Second threshold (integrated)
+        
+        # RR interval parameters
+        self.RR1 = 0  # Most recent RR interval
+        self.RR2 = 0  # Previous RR interval
+        self.RRAVERAGE1 = 0  # Average of last 8 RR intervals
+        self.RRAVERAGE2 = 0  # Average of last 8 RR intervals within limits
+        self.RR_LOW_LIMIT = 0
+        self.RR_HIGH_LIMIT = 0
+        self.RR_MISSED_LIMIT = 0
+        
+        # Detection flags
+        self.peak_detected = False
+        self.qrs_detected = False
+        self.refractory_period = 0
+        self.searchback = False
+        
+        # Buffers
+        self.peak_buffer = []
+        self.rr_buffer = []
+        self.signal_peaks = []
+        self.noise_peaks = []
+        self.qrs_peaks = []
+        
+    def bandpass_filter(self, ecg):
+        """Apply the bandpass filter (cascaded lowpass and highpass)"""
+        # Lowpass filter
+        lowpass = filtfilt(self.lowpass_b, self.lowpass_a, ecg)
+        
+        # Highpass filter
+        highpass = filtfilt(self.highpass_b, self.highpass_a, lowpass)
+        
+        return highpass
+    
+    def derivative(self, signal):
+        """Apply the derivative filter"""
+        return lfilter(self.derivative_b, self.derivative_a, signal)
+    
+    def squaring(self, signal):
+        """Square each sample point-wise"""
+        return np.square(signal)
+    
+    def moving_window_integration(self, signal):
+        """Apply moving window integration"""
+        window = np.ones(self.integration_window) / self.integration_window
+        return np.convolve(signal, window, 'same')
+    
+    def find_peaks(self, signal):
+        """Find peaks in the signal"""
+        # Simple peak detection (can be enhanced)
+        peaks = []
+        for i in range(1, len(signal)-1):
+            if signal[i] > signal[i-1] and signal[i] > signal[i+1]:
+                peaks.append(i)
+        return np.array(peaks)
+    
+    def adaptive_thresholding(self, peaks, signal, signal_type='filtered'):
+        """Apply adaptive thresholding to detect QRS complexes"""
+        qrs_peaks = []
+        noise_peaks = []
+        
+        if signal_type == 'filtered':
+            SPK = self.SPKF
+            NPK = self.NPKF
+            THRESHOLD1 = self.THRESHOLDF1
+            THRESHOLD2 = self.THRESHOLDF2
+        else:  # integrated
+            SPK = self.SPKI
+            NPK = self.NPKI
+            THRESHOLD1 = self.THRESHOLDI1
+            THRESHOLD2 = self.THRESHOLDI2
+        
+        for peak in peaks:
+            peak_value = signal[peak]
+            
+            # Check if peak is above threshold
+            if peak_value > THRESHOLD1:
+                # Classify as QRS complex
+                if signal_type == 'filtered':
+                    self.SPKF = 0.125 * peak_value + 0.875 * SPK
+                else:
+                    self.SPKI = 0.125 * peak_value + 0.875 * SPK
+                
+                qrs_peaks.append(peak)
+            else:
+                # Classify as noise
+                if signal_type == 'filtered':
+                    self.NPKF = 0.125 * peak_value + 0.875 * NPK
+                else:
+                    self.NPKI = 0.125 * peak_value + 0.875 * NPK
+                
+                noise_peaks.append(peak)
+        
+        # Update thresholds
+        if signal_type == 'filtered':
+            self.THRESHOLDF1 = self.NPKF + 0.25 * (self.SPKF - self.NPKF)
+            self.THRESHOLDF2 = 0.5 * self.THRESHOLDF1
+        else:
+            self.THRESHOLDI1 = self.NPKI + 0.25 * (self.SPKI - self.NPKI)
+            self.THRESHOLDI2 = 0.5 * self.THRESHOLDI1
+        
+        return qrs_peaks, noise_peaks
+    
+    def update_rr_intervals(self, current_peak):
+        """Update RR interval averages and limits"""
+        if len(self.qrs_peaks) > 1:
+            # Calculate current RR interval
+            self.RR2 = self.RR1
+            self.RR1 = (current_peak - self.qrs_peaks[-1]) / self.fs
+            
+            # Add to RR buffer (keep last 8)
+            self.rr_buffer.append(self.RR1)
+            if len(self.rr_buffer) > 8:
+                self.rr_buffer.pop(0)
+            
+            # Calculate RR averages
+            self.RRAVERAGE1 = np.mean(self.rr_buffer)
+            
+            # Calculate RR limits
+            self.RR_LOW_LIMIT = 0.92 * self.RRAVERAGE1
+            self.RR_HIGH_LIMIT = 1.16 * self.RRAVERAGE1
+            self.RR_MISSED_LIMIT = 1.66 * self.RRAVERAGE1
+    
+    def search_back(self, signal, integrated_signal):
+        """Search back for missed QRS complexes"""
+        if len(self.qrs_peaks) < 2:
+            return []
+        
+        last_qrs = self.qrs_peaks[-1]
+        current_time = len(signal)
+        
+        # Check if we've exceeded the missed limit
+        if (current_time - last_qrs) / self.fs > self.RR_MISSED_LIMIT:
+            # Search between last QRS and current time
+            search_start = last_qrs
+            search_end = current_time
+            
+            # Find peaks in this region
+            peaks = self.find_peaks(integrated_signal[search_start:search_end])
+            peaks = [p + search_start for p in peaks]
+            
+            # Apply second threshold
+            qrs_candidates = [p for p in peaks if integrated_signal[p] > self.THRESHOLDI2]
+            
+            if qrs_candidates:
+                # Select the highest peak as QRS
+                max_peak = max(qrs_candidates, key=lambda x: integrated_signal[x])
+                
+                # Update thresholds with lower weight
+                self.SPKI = 0.25 * integrated_signal[max_peak] + 0.75 * self.SPKI
+                self.SPKF = 0.25 * signal[max_peak] + 0.75 * self.SPKF
+                
+                return [max_peak]
+        
+        return []
+    
+    def t_wave_discrimination(self, candidate_peak, signal):
+        """Check if candidate peak is a T-wave"""
+        if len(self.qrs_peaks) < 1:
+            return False
+        
+        last_qrs = self.qrs_peaks[-1]
+        rr_interval = (candidate_peak - last_qrs) / self.fs
+        
+        # Check if within T-wave window (200ms to 360ms after QRS)
+        if 0.2 < rr_interval < 0.36:
+            # Calculate slope of candidate peak
+            candidate_slope = np.max(np.diff(signal[candidate_peak-2:candidate_peak+3]))
+            
+            # Calculate slope of last QRS
+            qrs_slope = np.max(np.diff(signal[last_qrs-2:last_qrs+3]))
+            
+            # If candidate slope is less than half of QRS slope, it's a T-wave
+            if candidate_slope < 0.5 * qrs_slope:
+                return True
+        
+        return False
+    
+    def process(self, ecg):
+        """Process ECG signal through all stages"""
+        # Reset parameters for new signal
+        self.reset_parameters()
+        
+        # 1. Bandpass filtering
+        filtered = self.bandpass_filter(ecg)
+        
+        # 2. Derivative
+        differentiated = self.derivative(filtered)
+        
+        # 3. Squaring
+        squared = self.squaring(differentiated)
+        
+        # 4. Moving window integration
+        integrated = self.moving_window_integration(squared)
+        
+        # 5. Find peaks in integrated signal
+        peaks = self.find_peaks(integrated)
+        
+        # 6. Adaptive thresholding
+        qrs_peaks, noise_peaks = self.adaptive_thresholding(peaks, integrated, 'integrated')
+        
+        # 7. Secondary thresholding on filtered signal
+        filtered_peaks = self.find_peaks(filtered)
+        filtered_qrs, filtered_noise = self.adaptive_thresholding(filtered_peaks, filtered, 'filtered')
+        
+        # 8. Combine results - require detection in both signals
+        combined_qrs = []
+        for qrs in qrs_peaks:
+            # Check if nearby peak in filtered signal
+            nearby = [p for p in filtered_qrs if abs(p - qrs) < 0.1 * self.fs]  # 100ms window
+            if nearby:
+                combined_qrs.append(qrs)
+        
+        # 9. Search back for missed beats
+        missed_qrs = self.search_back(filtered, integrated)
+        combined_qrs.extend(missed_qrs)
+        
+        # 10. Remove duplicates and sort
+        combined_qrs = sorted(list(set(combined_qrs)))
+        
+        # 11. T-wave discrimination
+        final_qrs = []
+        for qrs in combined_qrs:
+            if not self.t_wave_discrimination(qrs, filtered):
+                final_qrs.append(qrs)
+                self.qrs_peaks.append(qrs)
+                self.update_rr_intervals(qrs)
+        
+        return {
+            'filtered': filtered,
+            'differentiated': differentiated,
+            'squared': squared,
+            'integrated': integrated,
+            'qrs_peaks': final_qrs
+        }
+
+class LMSPanTompkins(PanTompkins):
+    def __init__(self, fs=200, mu=0.01, filter_order=5):
+        super().__init__(fs)
+        self.mu = mu  # LMS step size
+        self.filter_order = filter_order
+        self.weights = np.zeros(filter_order)
+        self.input_buffer = np.zeros(filter_order)
+        
+    def lms_update(self, x, desired):
+        """Update LMS filter weights"""
+        # Get filter output
+        y = np.dot(self.weights, self.input_buffer)
+        
+        # Calculate error
+        error = desired - y
+        
+        # Update weights
+        self.weights += self.mu * error * self.input_buffer
+        
+        # Update input buffer
+        self.input_buffer[1:] = self.input_buffer[:-1]
+        self.input_buffer[0] = x
+        
+        return y, error
+    
+    def adaptive_thresholding(self, peaks, signal, signal_type='filtered'):
+        """LMS-enhanced adaptive thresholding"""
+        qrs_peaks = []
+        noise_peaks = []
+        
+        if signal_type == 'filtered':
+            SPK = self.SPKF
+            NPK = self.NPKF
+            THRESHOLD1 = self.THRESHOLDF1
+            THRESHOLD2 = self.THRESHOLDF2
+        else:  # integrated
+            SPK = self.SPKI
+            NPK = self.NPKI
+            THRESHOLD1 = self.THRESHOLDI1
+            THRESHOLD2 = self.THRESHOLDI2
+        
+        for peak in peaks:
+            peak_value = signal[peak]
+            
+            # Use LMS to predict threshold
+            predicted_threshold, _ = self.lms_update(peak_value, THRESHOLD1)
+            
+            # Check if peak is above threshold
+            if peak_value > predicted_threshold:
+                # Classify as QRS complex
+                if signal_type == 'filtered':
+                    self.SPKF = 0.125 * peak_value + 0.875 * SPK
+                else:
+                    self.SPKI = 0.125 * peak_value + 0.875 * SPK
+                
+                qrs_peaks.append(peak)
+            else:
+                # Classify as noise
+                if signal_type == 'filtered':
+                    self.NPKF = 0.125 * peak_value + 0.875 * NPK
+                else:
+                    self.NPKI = 0.125 * peak_value + 0.875 * NPK
+                
+                noise_peaks.append(peak)
+        
+        # Update thresholds using LMS
+        if signal_type == 'filtered':
+            self.THRESHOLDF1 = self.NPKF + 0.25 * (self.SPKF - self.NPKF)
+            self.THRESHOLDF2 = 0.5 * self.THRESHOLDF1
+        else:
+            self.THRESHOLDI1 = self.NPKI + 0.25 * (self.SPKI - self.NPKI)
+            self.THRESHOLDI2 = 0.5 * self.THRESHOLDI1
+        
+        return qrs_peaks, noise_peaks
+
+def evaluate_performance(true_annotations, detected_peaks, fs=200, window=0.05):
+    """
+    Evaluate QRS detection performance
+    
+    Parameters:
+    - true_annotations: Array of sample indices for true QRS complexes
+    - detected_peaks: Array of sample indices for detected QRS complexes
+    - fs: Sampling frequency (Hz)
+    - window: Acceptance window (seconds)
+    
+    Returns:
+    - Dictionary of performance metrics
+    """
+    window_samples = int(window * fs)
+    true_positives = 0
+    false_positives = 0
+    matched_true = []
+    matched_detected = []
+    
+    # Match detections to annotations
+    for ann in true_annotations:
+        # Find closest detection within window
+        closest = None
+        min_dist = window_samples + 1
+        
+        for det in detected_peaks:
+            dist = abs(det - ann)
+            if dist <= window_samples and dist < min_dist:
+                closest = det
+                min_dist = dist
+        
+        if closest is not None:
+            true_positives += 1
+            matched_true.append(ann)
+            matched_detected.append(closest)
+    
+    false_positives = len(detected_peaks) - true_positives
+    false_negatives = len(true_annotations) - true_positives
+    
+    # Calculate metrics
+    sensitivity = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+    f1_score = 2 * (precision * sensitivity) / (precision + sensitivity) if (precision + sensitivity) > 0 else 0
+    
+    return {
+        'true_positives': true_positives,
+        'false_positives': false_positives,
+        'false_negatives': false_negatives,
+        'sensitivity': sensitivity,
+        'precision': precision,
+        'f1_score': f1_score,
+        'matched_true': matched_true,
+        'matched_detected': matched_detected
+    }
+
+def plot_ecg_with_detections(ecg, fs, true_annotations=None, detected_peaks=None, title='ECG with QRS Detections'):
+    """Plot ECG signal with annotations and detections"""
+    t = np.arange(len(ecg)) / fs
+    
+    plt.figure(figsize=(15, 5))
+    plt.plot(t, ecg, label='ECG Signal')
+    
+    if true_annotations is not None:
+        plt.scatter(np.array(true_annotations)/fs, ecg[true_annotations], 
+                   color='green', marker='o', label='True Annotations')
+    
+    if detected_peaks is not None:
+        plt.scatter(np.array(detected_peaks)/fs, ecg[detected_peaks], 
+                   color='red', marker='x', label='Detected Peaks')
+    
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude')
+    plt.title(title)
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+def analyze_filters(pt):
+    """Analyze filter characteristics"""
+    # Bandpass filter analysis (cascaded lowpass and highpass)
+    w_low, h_low = signal.freqz(pt.lowpass_b, pt.lowpass_a, fs=pt.fs)
+    w_high, h_high = signal.freqz(pt.highpass_b, pt.highpass_a, fs=pt.fs)
+    
+    # Combined bandpass response
+    w_band, h_band = signal.freqz(np.convolve(pt.lowpass_b, pt.highpass_b), 
+                                 np.convolve(pt.lowpass_a, pt.highpass_a), fs=pt.fs)
+    
+    # Derivative filter analysis
+    w_der, h_der = signal.freqz(pt.derivative_b, pt.derivative_a, fs=pt.fs)
+    
+    # Moving window integrator (FIR)
+    integrator_b = np.ones(pt.integration_window) / pt.integration_window
+    w_int, h_int = signal.freqz(integrator_b, [1], fs=pt.fs)
+    
+    # Plot magnitude responses
+    plt.figure(figsize=(12, 8))
+    
+    plt.subplot(2, 2, 1)
+    plt.plot(w_low, 20*np.log10(np.abs(h_low)), label='Lowpass')
+    plt.plot(w_high, 20*np.log10(np.abs(h_high)), label='Highpass')
+    plt.plot(w_band, 20*np.log10(np.abs(h_band)), label='Combined Bandpass')
+    plt.title('Magnitude Response (dB)')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Magnitude (dB)')
+    plt.grid(True)
+    plt.legend()
+    
+    plt.subplot(2, 2, 2)
+    plt.plot(w_der, 20*np.log10(np.abs(h_der)), label='Derivative')
+    plt.title('Derivative Filter Magnitude Response')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Magnitude (dB)')
+    plt.grid(True)
+    
+    plt.subplot(2, 2, 3)
+    plt.plot(w_int, 20*np.log10(np.abs(h_int)), label='Integrator')
+    plt.title('Moving Window Integrator Magnitude Response')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Magnitude (dB)')
+    plt.grid(True)
+    
+    plt.subplot(2, 2, 4)
+    plt.plot(w_band, np.angle(h_band)), label='Bandpass')
+    plt.plot(w_der, np.angle(h_der)), label='Derivative')
+    plt.title('Phase Response')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Phase (radians)')
+    plt.grid(True)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Plot pole-zero plots
+    plt.figure(figsize=(12, 8))
+    
+    plt.subplot(2, 2, 1)
+    plt.title('Lowpass Filter Pole-Zero Plot')
+    z, p, _ = signal.tf2zpk(pt.lowpass_b, pt.lowpass_a)
+    plt.scatter(np.real(z), np.imag(z), marker='o', facecolors='none', edgecolors='b', label='Zeros')
+    plt.scatter(np.real(p), np.imag(p), marker='x', color='r', label='Poles')
+    plt.axhline(0, color='black', linewidth=0.5)
+    plt.axvline(0, color='black', linewidth=0.5)
+    plt.grid(True)
+    plt.legend()
+    
+    plt.subplot(2, 2, 2)
+    plt.title('Highpass Filter Pole-Zero Plot')
+    z, p, _ = signal.tf2zpk(pt.highpass_b, pt.highpass_a)
+    plt.scatter(np.real(z), np.imag(z), marker='o', facecolors='none', edgecolors='b', label='Zeros')
+    plt.scatter(np.real(p), np.imag(p), marker='x', color='r', label='Poles')
+    plt.axhline(0, color='black', linewidth=0.5)
+    plt.axvline(0, color='black', linewidth=0.5)
+    plt.grid(True)
+    plt.legend()
+    
+    plt.subplot(2, 2, 3)
+    plt.title('Derivative Filter Pole-Zero Plot')
+    z, p, _ = signal.tf2zpk(pt.derivative_b, pt.derivative_a)
+    plt.scatter(np.real(z), np.imag(z), marker='o', facecolors='none', edgecolors='b', label='Zeros')
+    plt.scatter(np.real(p), np.imag(p), marker='x', color='r', label='Poles')
+    plt.axhline(0, color='black', linewidth=0.5)
+    plt.axvline(0, color='black', linewidth=0.5)
+    plt.grid(True)
+    plt.legend()
+    
+    plt.subplot(2, 2, 4)
+    plt.title('Combined Bandpass Pole-Zero Plot')
+    bandpass_b = np.convolve(pt.lowpass_b, pt.highpass_b)
+    bandpass_a = np.convolve(pt.lowpass_a, pt.highpass_a)
+    z, p, _ = signal.tf2zpk(bandpass_b, bandpass_a)
+    plt.scatter(np.real(z), np.imag(z), marker='o', facecolors='none', edgecolors='b', label='Zeros')
+    plt.scatter(np.real(p), np.imag(p), marker='x', color='r', label='Poles')
+    plt.axhline(0, color='black', linewidth=0.5)
+    plt.axvline(0, color='black', linewidth=0.5)
+    plt.grid(True)
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.show()
+
+def load_mit_bih_record(record_name='100', channels=[0], sampfrom=0, sampto=None):
+    """Load a record from the MIT-BIH Arrhythmia Database"""
+    record = wfdb.rdrecord(record_name, channels=channels, sampfrom=sampfrom, sampto=sampto)
+    annotation = wfdb.rdann(record_name, 'atr', sampfrom=sampfrom, sampto=sampto)
+    
+    # Get QRS annotations (symbol == 'N' for normal beats)
+    qrs_indices = [i for i, symbol in zip(annotation.sample, annotation.symbol) if symbol == 'N']
+    
+    return record.p_signal[:,0], qrs_indices, record.fs
+
+def main():
+    # Load MIT-BIH record
+    ecg, annotations, fs = load_mit_bih_record('100', sampto=10000)  # First 10 seconds
+    
+    # Initialize both algorithms
+    pt = PanTompkins(fs=fs)
+    lms_pt = LMSPanTompkins(fs=fs)
+    
+    # Analyze filter characteristics
+    print("Analyzing filter characteristics...")
+    analyze_filters(pt)
+    
+    # Process with original Pan-Tompkins
+    print("\nProcessing with original Pan-Tompkins algorithm...")
+    results_pt = pt.process(ecg)
+    
+    # Process with LMS-enhanced Pan-Tompkins
+    print("\nProcessing with LMS-enhanced Pan-Tompkins algorithm...")
+    results_lms = lms_pt.process(ecg)
+    
+    # Evaluate performance
+    print("\nEvaluating original Pan-Tompkins performance...")
+    eval_pt = evaluate_performance(annotations, results_pt['qrs_peaks'], fs=fs)
+    print(f"Sensitivity: {eval_pt['sensitivity']:.2%}")
+    print(f"Precision: {eval_pt['precision']:.2%}")
+    print(f"F1 Score: {eval_pt['f1_score']:.2%}")
+    
+    print("\nEvaluating LMS-enhanced Pan-Tompkins performance...")
+    eval_lms = evaluate_performance(annotations, results_lms['qrs_peaks'], fs=fs)
+    print(f"Sensitivity: {eval_lms['sensitivity']:.2%}")
+    print(f"Precision: {eval_lms['precision']:.2%}")
+    print(f"F1 Score: {eval_lms['f1_score']:.2%}")
+    
+    # Plot results
+    plot_ecg_with_detections(ecg, fs, annotations, results_pt['qrs_peaks'], 
+                            'Original Pan-Tompkins QRS Detection')
+    plot_ecg_with_detections(ecg, fs, annotations, results_lms['qrs_peaks'], 
+                            'LMS-enhanced Pan-Tompkins QRS Detection')
+    
+    # Plot intermediate signals
+    plt.figure(figsize=(15, 10))
+    
+    plt.subplot(4, 1, 1)
+    plt.plot(ecg)
+    plt.title('
